@@ -12,7 +12,7 @@ import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 
 export default function Navbar() {
   const [location] = useLocation();
-  const { user, isAuthenticated, isLoading } = useAuth();
+  const { user, isAuthenticated, isLoading, logout } = useAuth();
 
   return (
     <nav className="bg-wolves-black shadow-lg sticky top-0 z-50">
@@ -63,11 +63,11 @@ export default function Navbar() {
                       <Button variant="ghost" className="relative h-8 w-8 rounded-full">
                         <Avatar className="h-8 w-8">
                           <AvatarImage 
-                            src={user?.profileImageUrl || ""} 
-                            alt={user?.firstName || "User"} 
+                            src="" 
+                            alt={user?.displayName || "User"} 
                           />
                           <AvatarFallback>
-                            {user?.firstName?.[0] || user?.email?.[0] || "U"}
+                            {user?.displayName?.[0] || user?.email?.[0] || "U"}
                           </AvatarFallback>
                         </Avatar>
                       </Button>
@@ -75,10 +75,7 @@ export default function Navbar() {
                     <DropdownMenuContent className="w-56" align="end" forceMount>
                       <DropdownMenuItem className="flex flex-col items-start">
                         <div className="text-sm font-medium">
-                          {user?.firstName && user?.lastName 
-                            ? `${user.firstName} ${user.lastName}`
-                            : user?.email
-                          }
+                          {user?.displayName || user?.email}
                         </div>
                         <div className="text-xs text-gray-500">{user?.email}</div>
                       </DropdownMenuItem>
@@ -86,20 +83,21 @@ export default function Navbar() {
                         <Heart className="mr-2 h-4 w-4" />
                         <span>Wishlist</span>
                       </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => window.location.href = "/api/logout"}>
+                      <DropdownMenuItem onClick={() => logout()}>
                         <LogOut className="mr-2 h-4 w-4" />
                         <span>Log out</span>
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
                 ) : (
-                  <Button
-                    onClick={() => window.location.href = "/api/login"}
-                    className="bg-wolves-gold text-wolves-black hover:bg-yellow-400"
-                  >
-                    <User className="mr-2 h-4 w-4" />
-                    Sign In
-                  </Button>
+                  <Link href="/auth">
+                    <Button
+                      className="bg-wolves-gold text-wolves-black hover:bg-yellow-400"
+                    >
+                      <User className="mr-2 h-4 w-4" />
+                      Sign In
+                    </Button>
+                  </Link>
                 )}
               </>
             )}

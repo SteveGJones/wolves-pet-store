@@ -1,29 +1,158 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
 import { storage } from "./storage";
-import { setupAuth, isAuthenticated } from "./replitAuth";
+import { setupAuth, isAuthenticated, registerSchema, loginSchema, createUser, findUserByEmail, authenticateUser, createUserSession } from "./auth";
 import {
   insertPetSchema,
   insertInquirySchema,
   insertWishlistSchema,
   insertPetCategorySchema,
 } from "@shared/schema";
+import { z } from "zod";
 
 export async function registerRoutes(app: Express): Promise<Server> {
+  // Health check endpoint for K8s probes
+  app.get('/api/health', async (req, res) => {
+    try {
+      // Check database connectivity
+      const dbHealthy = await checkDatabaseHealth();
+      
+      const health = {
+        status: dbHealthy ? 'healthy' : 'degraded',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        environment: process.env.NODE_ENV || 'development',
+        version: process.env.npm_package_version || '1.0.0',
+        checks: {
+          database: dbHealthy ? 'healthy' : 'unhealthy'
+        }
+      };
+
+      res.status(dbHealthy ? 200 : 503).json(health);
+    } catch (error) {
+      res.status(503).json({
+        status: 'unhealthy',
+        timestamp: new Date().toISOString(),
+        error: 'Health check failed',
+        uptime: process.uptime()
+      });
+    }
+  });
+
+  // Database health check function
+  async function checkDatabaseHealth(): Promise<boolean> {
+    try {
+      const { db } = await import('./db');
+      // Simple query to check database connectivity
+      await db.execute('SELECT 1');
+      return true;
+    } catch (error) {
+      console.error('Database health check failed:', error);
+      return false;
+    }
+  }
+
   // Auth middleware
   await setupAuth(app);
 
-  // Auth routes
-  app.get('/api/auth/user', isAuthenticated, async (req: any, res) => {
+  // New Authentication Endpoints
+  // Registration endpoint
+  app.post('/api/auth/register', async (req, res) => {
     try {
-      const userId = req.user.claims.sub;
-      const user = await storage.getUser(userId);
-      res.json(user);
+      // Validate input
+      const validatedData = registerSchema.parse(req.body);
+      
+      // Check if user already exists
+      const existingUser = await findUserByEmail(validatedData.email);
+      if (existingUser) {
+        return res.status(409).json({
+          error: "An account with this email already exists",
+          code: "EMAIL_EXISTS"
+        });
+      }
+      
+      // Create user
+      const user = await createUser(validatedData);
+      
+      // Create session
+      req.session.user = createUserSession(user);
+      
+      res.status(201).json({ user });
     } catch (error) {
-      console.error("Error fetching user:", error);
-      res.status(500).json({ message: "Failed to fetch user" });
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({
+          error: "Invalid input data",
+          code: "VALIDATION_ERROR",
+          details: error.errors
+        });
+      }
+      
+      console.error('Registration error:', error);
+      res.status(500).json({
+        error: "Registration failed",
+        code: "REGISTRATION_ERROR"
+      });
     }
   });
+
+  // Login endpoint
+  app.post('/api/auth/login', async (req, res) => {
+    try {
+      // Validate input
+      const { email, password } = loginSchema.parse(req.body);
+      
+      // Authenticate user
+      const user = await authenticateUser(email, password);
+      if (!user) {
+        return res.status(401).json({
+          error: "Invalid email or password",
+          code: "INVALID_CREDENTIALS"
+        });
+      }
+      
+      // Create session
+      req.session.user = createUserSession(user);
+      
+      res.json({ user });
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        return res.status(400).json({
+          error: "Email and password are required",
+          code: "MISSING_CREDENTIALS"
+        });
+      }
+      
+      console.error('Login error:', error);
+      res.status(500).json({
+        error: "Login failed",
+        code: "LOGIN_ERROR"
+      });
+    }
+  });
+
+  // Logout endpoint
+  app.post('/api/auth/logout', (req, res) => {
+    req.session.destroy((err) => {
+      if (err) {
+        console.error('Logout error:', err);
+        return res.status(500).json({
+          error: "Logout failed",
+          code: "LOGOUT_ERROR"
+        });
+      }
+      
+      res.json({
+        success: true,
+        message: "Logged out successfully"
+      });
+    });
+  });
+
+  // Get current user endpoint
+  app.get('/api/auth/user', isAuthenticated, (req, res) => {
+    res.json({ user: req.user });
+  });
+
 
   // Pet categories
   app.get("/api/pet-categories", async (req, res) => {
@@ -38,8 +167,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/pet-categories", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -89,8 +217,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/pets", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -105,8 +232,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/pets/:id", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -122,8 +248,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete("/api/pets/:id", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -139,8 +264,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Admin route for pets with categories
   app.get("/api/admin/pets", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -177,8 +301,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.get("/api/admin/inquiries", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -192,8 +315,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.put("/api/admin/inquiries/:id", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 
@@ -210,7 +332,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Wishlist
   app.get("/api/wishlist", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.userId;
       const wishlist = await storage.getUserWishlist(userId);
       res.json(wishlist);
     } catch (error) {
@@ -221,7 +343,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.post("/api/wishlist", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.userId;
       const { petId } = req.body;
       
       const validatedData = insertWishlistSchema.parse({
@@ -239,7 +361,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   app.delete("/api/wishlist/:petId", isAuthenticated, async (req: any, res) => {
     try {
-      const userId = req.user.claims.sub;
+      const userId = req.user.userId;
       const petId = Number(req.params.petId);
       
       await storage.removeFromWishlist(userId, petId);
@@ -253,8 +375,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // Dashboard stats
   app.get("/api/admin/dashboard-stats", isAuthenticated, async (req: any, res) => {
     try {
-      const user = await storage.getUser(req.user.claims.sub);
-      if (!user?.isAdmin) {
+      if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
       }
 

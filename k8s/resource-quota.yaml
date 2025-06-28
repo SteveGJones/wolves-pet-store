@@ -1,0 +1,70 @@
+---
+# Resource quota for the petstore namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: petstore-quota
+  namespace: petstore
+  labels:
+    component: resource-management
+spec:
+  hard:
+    # Compute resources
+    requests.cpu: "2"
+    requests.memory: 4Gi
+    limits.cpu: "4"
+    limits.memory: 8Gi
+    requests.ephemeral-storage: 2Gi
+    limits.ephemeral-storage: 4Gi
+    
+    # Storage resources
+    persistentvolumeclaims: "5"
+    requests.storage: 20Gi
+    
+    # Object counts
+    pods: "10"
+    services: "5"
+    secrets: "10"
+    configmaps: "10"
+    replicationcontrollers: "0"
+    resourcequotas: "1"
+
+---
+# Limit range for default resource constraints
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: petstore-limits
+  namespace: petstore
+  labels:
+    component: resource-management
+spec:
+  limits:
+  # Default container limits
+  - default:
+      cpu: 500m
+      memory: 512Mi
+      ephemeral-storage: 1Gi
+    defaultRequest:
+      cpu: 100m
+      memory: 128Mi
+      ephemeral-storage: 100Mi
+    type: Container
+    
+  # Pod limits
+  - max:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    min:
+      cpu: 10m
+      memory: 32Mi
+      ephemeral-storage: 10Mi
+    type: Pod
+    
+  # PVC limits
+  - max:
+      storage: 10Gi
+    min:
+      storage: 1Gi
+    type: PersistentVolumeClaim

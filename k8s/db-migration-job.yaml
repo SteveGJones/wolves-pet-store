@@ -1,0 +1,50 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: petstore
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+      - name: wait-for-postgres
+        image: postgres:15-alpine
+        command:
+        - sh
+        - -c
+        - |
+          until pg_isready -h postgres -U postgres; do
+            echo "Waiting for postgres to be ready..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+        envFrom:
+        - secretRef:
+            name: postgres-secret
+      containers:
+      - name: migrate
+        image: petstore:test
+        imagePullPolicy: IfNotPresent
+        command:
+        - sh
+        - -c
+        - |
+          echo "Starting database migration..."
+          node dist/scripts/migrate.js
+          if [ $? -eq 0 ]; then
+            echo "Migration completed successfully"
+          else
+            echo "Migration failed"
+            exit 1
+          fi
+        envFrom:
+        - secretRef:
+            name: postgres-secret
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"

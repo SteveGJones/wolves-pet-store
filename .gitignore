@@ -1,6 +1,160 @@
-node_modules
-dist
-.DS_Store
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+dist/
+build/
+.next/
 server/public
-vite.config.ts.*
+
+# Cache directories
+.npm
+.yarn/cache
+.pnpm-store
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# nyc test coverage
+.nyc_output
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
 *.tar.gz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache (https://parceljs.org/)
+.cache
+.parcel-cache
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless/
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+
+# VS Code settings
+.vscode/
+
+# WebStorm/IntelliJ settings
+.idea/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Database files (for local development)
+*.sqlite
+*.sqlite3
+*.db
+
+# Docker
+.dockerignore
+
+# Kubernetes
+.kube/
+*.kubeconfig
+
+# Skaffold
+skaffold_dev_log.txt
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# Testing
+test-results/
+playwright-report/
+playwright/.cache/
+
+# TypeScript
+*.tsbuildinfo
+vite.config.ts.*
+
+# ESLint
+.eslintcache
+
+# Prettier
+.prettierignore
+
+# Misc
+.turbo
+
+# Security - Never commit these
+.env.production
+*.pem
+*.key
+*.crt
+secrets/
+credentials/
+
+# IDE temporary files
+.vscode/settings.json.backup
+.idea/workspace.xml.backup
+
+# OS temporary files
+*.tmp
+*.temp
+.backup
+.swp
+.swo

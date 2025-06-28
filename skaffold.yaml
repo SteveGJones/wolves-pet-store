@@ -1,0 +1,109 @@
+apiVersion: skaffold/v4beta6
+kind: Config
+metadata:
+  name: petstore
+
+build:
+  artifacts:
+  - image: petstore
+    docker:
+      dockerfile: Dockerfile
+      target: production
+  tagPolicy:
+    gitCommit: {}
+  local:
+    push: false
+
+manifests:
+  rawYaml:
+  - k8s/namespace.yaml
+  - k8s/resource-quota.yaml
+  - k8s/postgres-configmap.yaml
+  - k8s/postgres-secret.yaml
+  - k8s/postgres-statefulset.yaml
+  - k8s/postgres-service.yaml
+  - k8s/app-configmap.yaml
+  - k8s/app-secrets.yaml
+  - k8s/app-deployment.yaml
+  - k8s/app-service.yaml
+  - k8s/app-ingress.yaml
+  - k8s/network-policies.yaml
+
+deploy:
+  kubectl: {}
+
+portForward:
+- resourceType: service
+  resourceName: postgres
+  port: 5432
+  localPort: 5432
+- resourceType: service
+  resourceName: petstore-app
+  port: 5000
+  localPort: 3000
+
+profiles:
+- name: dev
+  build:
+    artifacts:
+    - image: petstore
+      docker:
+        dockerfile: Dockerfile
+        target: production
+    tagPolicy:
+      sha256: {}
+    local:
+      push: false
+  manifests:
+    rawYaml:
+    - k8s/namespace.yaml
+    - k8s/resource-quota.yaml
+    - k8s/postgres-configmap.yaml
+    - k8s/postgres-secret.yaml
+    - k8s/postgres-statefulset.yaml
+    - k8s/postgres-service.yaml
+    - k8s/db-migration-job.yaml
+    - k8s/app-configmap.yaml
+    - k8s/app-secrets.yaml
+    - k8s/app-deployment.yaml
+    - k8s/app-service.yaml
+    - k8s/network-policies.yaml
+  portForward:
+  - resourceType: service
+    resourceName: postgres
+    port: 5432
+    localPort: 5432
+  - resourceType: service
+    resourceName: petstore-app
+    port: 5000
+    localPort: 3000
+
+- name: prod
+  build:
+    artifacts:
+    - image: petstore
+      docker:
+        dockerfile: Dockerfile
+        target: production
+    tagPolicy:
+      gitCommit: {}
+    local:
+      push: false
+  manifests:
+    rawYaml:
+    - k8s/namespace.yaml
+    - k8s/resource-quota.yaml
+    - k8s/postgres-configmap.yaml
+    - k8s/postgres-secret.yaml
+    - k8s/postgres-statefulset.yaml
+    - k8s/postgres-service.yaml
+    - k8s/db-migration-job.yaml
+    - k8s/app-configmap.yaml
+    - k8s/app-secrets.yaml
+    - k8s/app-deployment.yaml
+    - k8s/app-service.yaml
+    - k8s/app-ingress.yaml
+    - k8s/app-hpa.yaml
+    - k8s/network-policies.yaml
+  deploy:
+    kubectl: {}

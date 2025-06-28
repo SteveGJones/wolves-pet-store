@@ -9,24 +9,22 @@ import Landing from "@/pages/landing";
 import Home from "@/pages/home";
 import AdminDashboard from "@/pages/admin-dashboard";
 import PetDetails from "@/pages/pet-details";
+import { AuthPage } from "@/pages/auth";
+import { ProtectedRoute } from "@/components/auth/protected-route";
 
 function Router() {
   const { isAuthenticated, isLoading } = useAuth();
 
   return (
     <Switch>
-      {isLoading || !isAuthenticated ? (
-        <>
-          <Route path="/" component={Landing} />
-          <Route path="/pets/:id" component={PetDetails} />
-        </>
-      ) : (
-        <>
-          <Route path="/" component={Home} />
-          <Route path="/admin" component={AdminDashboard} />
-          <Route path="/pets/:id" component={PetDetails} />
-        </>
-      )}
+      <Route path="/auth" component={AuthPage} />
+      <Route path="/" component={isAuthenticated ? Home : Landing} />
+      <Route path="/pets/:id" component={PetDetails} />
+      <Route path="/admin">
+        <ProtectedRoute requireAdmin={true}>
+          <AdminDashboard />
+        </ProtectedRoute>
+      </Route>
       <Route component={NotFound} />
     </Switch>
   );

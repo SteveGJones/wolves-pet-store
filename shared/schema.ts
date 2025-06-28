@@ -25,13 +25,15 @@ export const sessions = pgTable(
   (table) => [index("IDX_session_expire").on(table.expire)],
 );
 
-// User storage table (required for Replit Auth)
+// User storage table (updated for UUID and bcrypt authentication)
 export const users = pgTable("users", {
-  id: varchar("id").primaryKey().notNull(),
-  email: varchar("email").unique(),
-  firstName: varchar("first_name"),
-  lastName: varchar("last_name"),
-  profileImageUrl: varchar("profile_image_url"),
+  id: varchar("id").primaryKey().$defaultFn(() => crypto.randomUUID()),
+  email: varchar("email").unique().notNull(),
+  password: varchar("password").notNull(), // bcrypt hash
+  displayName: varchar("display_name"), // User's preferred name
+  firstName: varchar("first_name"), // Optional
+  lastName: varchar("last_name"), // Optional
+  profileImageUrl: varchar("profile_image_url"), // Optional
   isAdmin: boolean("is_admin").default(false),
   createdAt: timestamp("created_at").defaultNow(),
   updatedAt: timestamp("updated_at").defaultNow(),
@@ -166,6 +168,19 @@ export const insertInquirySchema = createInsertSchema(inquiries).omit({
 export const insertWishlistSchema = createInsertSchema(wishlists).omit({
   id: true,
   createdAt: true,
+});
+
+// Update Zod validation schemas for new auth system
+export const insertUserSchema = createInsertSchema(users).omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
+// Add registration schema with password validation
+export const registerUserSchema = insertUserSchema.extend({
+  password: z.string().min(8).regex(/[!@#$%^&*()_+\-=\[\]{}|;:,.<>?]/, 
+    "Password must contain at least one special character")
 });
 
 // Export types

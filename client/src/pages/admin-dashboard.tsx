@@ -154,7 +154,7 @@ export default function AdminDashboard() {
       pet.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       pet.breed?.toLowerCase().includes(searchTerm.toLowerCase());
     
-    const matchesStatus = !statusFilter || pet.status === statusFilter;
+    const matchesStatus = !statusFilter || statusFilter === "all" || pet.status === statusFilter;
     
     return matchesSearch && matchesStatus;
   });
@@ -282,7 +282,7 @@ export default function AdminDashboard() {
                         <SelectValue placeholder="All Status" />
                       </SelectTrigger>
                       <SelectContent>
-                        <SelectItem value="">All Status</SelectItem>
+                        <SelectItem value="all">All Status</SelectItem>
                         <SelectItem value="available">Available</SelectItem>
                         <SelectItem value="pending">Pending</SelectItem>
                         <SelectItem value="adopted">Adopted</SelectItem>

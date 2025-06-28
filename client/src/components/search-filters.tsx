@@ -61,16 +61,16 @@ export default function SearchFilters({ filters, onFiltersChange, categories }: 
                   Pet Type
                 </label>
                 <Select
-                  value={filters.categoryId?.toString() || ""}
+                  value={filters.categoryId?.toString() || "all"}
                   onValueChange={(value) => 
-                    handleFilterChange("categoryId", value ? parseInt(value) : undefined)
+                    handleFilterChange("categoryId", value === "all" ? undefined : parseInt(value))
                   }
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="All Types" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">All Types</SelectItem>
+                    <SelectItem value="all">All Types</SelectItem>
                     {categories.map((category) => (
                       <SelectItem key={category.id} value={category.id.toString()}>
                         {category.name}
@@ -86,14 +86,14 @@ export default function SearchFilters({ filters, onFiltersChange, categories }: 
                   Age
                 </label>
                 <Select
-                  value={filters.age}
-                  onValueChange={(value) => handleFilterChange("age", value)}
+                  value={filters.age || "any"}
+                  onValueChange={(value) => handleFilterChange("age", value === "any" ? "" : value)}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Any Age" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">Any Age</SelectItem>
+                    <SelectItem value="any">Any Age</SelectItem>
                     <SelectItem value="Puppy/Kitten">Puppy/Kitten</SelectItem>
                     <SelectItem value="Young">Young</SelectItem>
                     <SelectItem value="Adult">Adult</SelectItem>
@@ -108,14 +108,14 @@ export default function SearchFilters({ filters, onFiltersChange, categories }: 
                   Size
                 </label>
                 <Select
-                  value={filters.size}
-                  onValueChange={(value) => handleFilterChange("size", value)}
+                  value={filters.size || "any"}
+                  onValueChange={(value) => handleFilterChange("size", value === "any" ? "" : value)}
                 >
                   <SelectTrigger>
                     <SelectValue placeholder="Any Size" />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value="">Any Size</SelectItem>
+                    <SelectItem value="any">Any Size</SelectItem>
                     <SelectItem value="Small">Small</SelectItem>
                     <SelectItem value="Medium">Medium</SelectItem>
                     <SelectItem value="Large">Large</SelectItem>

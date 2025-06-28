@@ -115,6 +115,9 @@ This is a full-stack web application for a pet store built with a modern TypeScr
 ```
 Changelog:
 - June 28, 2025. Initial setup
+- June 28, 2025. Fixed SelectItem component errors preventing app loading
+- June 28, 2025. Added comprehensive pet database with 35 diverse animals including dogs, cats, birds, rabbits, reptiles covering 30+ breeds
+- June 28, 2025. Expanded categories to include Reptiles and Fish alongside original Dogs, Cats, Birds, and Small Animals
 ```
 
 ## User Preferences

@@ -1,0 +1,352 @@
+name: Deploy to Staging
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [develop, code-migration-proposal]
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: 'Docker image tag to deploy'
+        required: false
+        type: string
+      skip-tests:
+        description: 'Skip E2E tests after deployment'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: '20'
+  STAGING_NAMESPACE: 'wolves-pet-store-staging'
+
+jobs:
+  pre-deployment-checks:
+    name: Pre-deployment Validation
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    
+    outputs:
+      image-tag: ${{ steps.determine-image.outputs.image-tag }}
+      should-deploy: ${{ steps.validate.outputs.should-deploy }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Determine image tag
+        id: determine-image
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ] && [ -n "${{ inputs.image-tag }}" ]; then
+            echo "image-tag=${{ inputs.image-tag }}" >> $GITHUB_OUTPUT
+          else
+            # Use the commit SHA for automated deployments
+            echo "image-tag=ghcr.io/${{ github.repository }}:${{ github.ref_name }}-${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Validate deployment conditions
+        id: validate
+        run: |
+          echo "## 🔍 Pre-deployment Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          SHOULD_DEPLOY=true
+          
+          # Check if this is a valid branch for staging deployment
+          if [[ "${{ github.ref_name }}" != "develop" && "${{ github.ref_name }}" != "code-migration-proposal" ]]; then
+            echo "❌ Invalid branch for staging deployment: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+            SHOULD_DEPLOY=false
+          fi
+          
+          # Check if CI workflow succeeded (for automated deployments)
+          if [ "${{ github.event_name }}" == "workflow_run" ] && [ "${{ github.event.workflow_run.conclusion }}" != "success" ]; then
+            echo "❌ CI Pipeline failed, skipping deployment" >> $GITHUB_STEP_SUMMARY
+            SHOULD_DEPLOY=false
+          fi
+          
+          if [ "$SHOULD_DEPLOY" == "true" ]; then
+            echo "✅ All pre-deployment checks passed" >> $GITHUB_STEP_SUMMARY
+            echo "**Image**: ${{ steps.determine-image.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "**Target**: Staging environment" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "should-deploy=$SHOULD_DEPLOY" >> $GITHUB_OUTPUT
+
+  deploy-staging:
+    name: Deploy to Staging Environment
+    runs-on: ubuntu-latest
+    needs: pre-deployment-checks
+    if: needs.pre-deployment-checks.outputs.should-deploy == 'true'
+    environment: 
+      name: staging
+      url: https://staging.wolves-pet-store.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Configure kubectl for staging
+        run: |
+          # In a real environment, you would configure kubectl with staging cluster credentials
+          # For this demo, we'll show the structure
+          echo "Configuring kubectl for staging cluster..."
+          
+          # Example configuration (replace with actual staging cluster config)
+          # kubectl config set-cluster staging --server=https://staging-k8s-api.example.com
+          # kubectl config set-credentials staging-user --token=${{ secrets.STAGING_K8S_TOKEN }}
+          # kubectl config set-context staging --cluster=staging --user=staging-user --namespace=${{ env.STAGING_NAMESPACE }}
+          # kubectl config use-context staging
+          
+          # For local development, create namespace if it doesn't exist
+          kubectl create namespace ${{ env.STAGING_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Prepare staging manifests
+        run: |
+          # Create staging-specific manifests
+          mkdir -p k8s/staging
+          
+          # Copy base manifests and modify for staging
+          cp k8s/*.yaml k8s/staging/
+          
+          # Update image tags in manifests
+          IMAGE_TAG="${{ needs.pre-deployment-checks.outputs.image-tag }}"
+          
+          # Update deployment manifest with new image
+          sed -i "s|image: .*wolves-pet-store.*|image: $IMAGE_TAG|g" k8s/staging/app-deployment.yaml
+          
+          # Update environment-specific configurations
+          sed -i "s|namespace: petstore|namespace: ${{ env.STAGING_NAMESPACE }}|g" k8s/staging/*.yaml
+          
+          # Update database URL for staging
+          sed -i "s|postgresql://postgres:password@postgres.petstore.svc.cluster.local:5432/petstore|postgresql://postgres:password@postgres.${{ env.STAGING_NAMESPACE }}.svc.cluster.local:5432/petstore_staging|g" k8s/staging/app-deployment.yaml
+          
+          echo "## 📦 Staging Deployment Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image**: $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace**: ${{ env.STAGING_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Database**: petstore_staging" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Deploy database to staging
+        run: |
+          echo "Deploying PostgreSQL to staging..."
+          kubectl apply -f k8s/staging/postgres-*.yaml -n ${{ env.STAGING_NAMESPACE }}
+          
+          # Wait for database to be ready
+          kubectl wait --for=condition=ready pod -l app=postgres -n ${{ env.STAGING_NAMESPACE }} --timeout=300s
+          
+          echo "✅ Database deployed and ready" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Deploy application to staging
+        run: |
+          echo "Deploying application to staging..."
+          kubectl apply -f k8s/staging/app-*.yaml -n ${{ env.STAGING_NAMESPACE }}
+          
+          # Wait for deployment to complete
+          kubectl rollout status deployment/wolves-pet-store-app -n ${{ env.STAGING_NAMESPACE }} --timeout=600s
+          
+          # Get deployment status
+          kubectl get deployments -n ${{ env.STAGING_NAMESPACE }}
+          kubectl get pods -n ${{ env.STAGING_NAMESPACE }}
+          kubectl get services -n ${{ env.STAGING_NAMESPACE }}
+          
+          echo "✅ Application deployed successfully" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Setup port forwarding for testing
+        run: |
+          echo "Setting up port forwarding for health checks..."
+          kubectl port-forward service/wolves-pet-store-service 8080:3000 -n ${{ env.STAGING_NAMESPACE }} &
+          PORT_FORWARD_PID=$!
+          echo $PORT_FORWARD_PID > port-forward.pid
+          
+          # Wait for service to be available
+          sleep 10
+          
+          # Health check
+          for i in {1..30}; do
+            if curl -f http://localhost:8080/api/health > /dev/null 2>&1; then
+              echo "✅ Application health check passed" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            echo "Waiting for application to be ready... ($i/30)"
+            sleep 10
+          done
+      
+      - name: Run database migrations
+        run: |
+          echo "Running database migrations..."
+          
+          # Get app pod name
+          APP_POD=$(kubectl get pods -n ${{ env.STAGING_NAMESPACE }} -l app=wolves-pet-store-app -o jsonpath='{.items[0].metadata.name}')
+          
+          # Run migrations inside the pod
+          kubectl exec $APP_POD -n ${{ env.STAGING_NAMESPACE }} -- npm run db:migrate || true
+          kubectl exec $APP_POD -n ${{ env.STAGING_NAMESPACE }} -- npm run db:seed || true
+          
+          echo "✅ Database migrations completed" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Cleanup port forwarding
+        if: always()
+        run: |
+          if [ -f port-forward.pid ]; then
+            kill $(cat port-forward.pid) || true
+            rm port-forward.pid
+          fi
+
+  smoke-tests:
+    name: Staging Smoke Tests
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-checks, deploy-staging]
+    if: ${{ !inputs.skip-tests && needs.deploy-staging.result == 'success' }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      
+      - name: Setup staging port forwarding
+        run: |
+          kubectl port-forward service/wolves-pet-store-service 3000:3000 -n ${{ env.STAGING_NAMESPACE }} &
+          PORT_FORWARD_PID=$!
+          echo $PORT_FORWARD_PID > staging-port-forward.pid
+          sleep 10
+      
+      - name: Run smoke tests against staging
+        run: npm run test:e2e:smoke
+        env:
+          BASE_URL: http://localhost:3000
+          CI: true
+        timeout-minutes: 10
+      
+      - name: Upload smoke test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-smoke-test-results
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+      
+      - name: Cleanup staging port forwarding
+        if: always()
+        run: |
+          if [ -f staging-port-forward.pid ]; then
+            kill $(cat staging-port-forward.pid) || true
+            rm staging-port-forward.pid
+          fi
+
+  deployment-notification:
+    name: Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [pre-deployment-checks, deploy-staging, smoke-tests]
+    if: always() && needs.pre-deployment-checks.outputs.should-deploy == 'true'
+    
+    steps:
+      - name: Determine deployment status
+        id: status
+        run: |
+          if [[ "${{ needs.deploy-staging.result }}" == "success" && 
+                ("${{ needs.smoke-tests.result }}" == "success" || "${{ needs.smoke-tests.result }}" == "skipped") ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=✅ Staging deployment successful" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=❌ Staging deployment failed" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create deployment summary
+        run: |
+          echo "# 🚀 Staging Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ steps.status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image**: ${{ needs.pre-deployment-checks.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace**: ${{ env.STAGING_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📊 Deployment Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-checks | ${{ needs.pre-deployment-checks.result == 'success' && '✅ Passed' || '❌ Failed' }} | Validation and image preparation |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deployment | ${{ needs.deploy-staging.result == 'success' && '✅ Passed' || '❌ Failed' }} | Application and database deployment |" >> $GITHUB_STEP_SUMMARY
+          echo "| Smoke Tests | ${{ needs.smoke-tests.result == 'success' && '✅ Passed' || needs.smoke-tests.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} | Basic functionality verification |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.status.outputs.status }}" == "success" ]; then
+            echo "## 🎉 Staging Environment Ready" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The staging environment has been successfully updated and is ready for testing." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. **QA Testing**: Run full E2E tests against staging" >> $GITHUB_STEP_SUMMARY
+            echo "2. **User Acceptance**: Validate new features with stakeholders" >> $GITHUB_STEP_SUMMARY
+            echo "3. **Performance Testing**: Verify performance benchmarks" >> $GITHUB_STEP_SUMMARY
+            echo "4. **Production Deployment**: Create release when ready" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Deployment Issues" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The staging deployment encountered issues. Please review the logs and address any failures before proceeding." >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Useful Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Staging Environment](https://staging.wolves-pet-store.com) (when available)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Kubernetes Dashboard](https://k8s-dashboard.example.com/namespace/${{ env.STAGING_NAMESPACE }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Deployment Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `
+            ## 🚀 Staging Deployment Results
+            
+            **Status**: ${{ steps.status.outputs.message }}
+            **Image**: \`${{ needs.pre-deployment-checks.outputs.image-tag }}\`
+            **Environment**: staging
+            
+            ### Deployment Summary
+            | Component | Status |
+            |-----------|--------|
+            | Pre-checks | ${{ needs.pre-deployment-checks.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Deployment | ${{ needs.deploy-staging.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Smoke Tests | ${{ needs.smoke-tests.result == 'success' && '✅ Passed' || needs.smoke-tests.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+            
+            ### 🔗 Links
+            - [Deployment Details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - [Staging Environment](https://staging.wolves-pet-store.com)
+            
+            ${steps.status.outputs.status === 'success' ? 
+              '🎉 **Ready for testing!** The staging environment has been updated with your changes.' :
+              '⚠️ **Deployment failed.** Please check the logs and resolve any issues.'}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

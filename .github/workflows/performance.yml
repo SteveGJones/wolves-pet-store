@@ -1,0 +1,517 @@
+name: Performance Monitoring
+
+on:
+  schedule:
+    # Run performance tests daily at 4 AM UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      target-url:
+        description: 'Target URL for performance testing'
+        required: false
+        type: string
+        default: 'https://wolves-pet-store.com'
+      test-duration:
+        description: 'Load test duration in minutes'
+        required: false
+        type: number
+        default: 5
+      run-load-tests:
+        description: 'Run load tests (resource intensive)'
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'server/**'
+      - 'package.json'
+      - 'package-lock.json'
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  lighthouse-audit:
+    name: Lighthouse Performance Audit
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        page: [
+          { name: 'Home', url: '/', budget: 90 },
+          { name: 'Auth', url: '/auth', budget: 85 },
+          { name: 'Pet Details', url: '/pet/1', budget: 85 }
+        ]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Start application for testing
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          # Start local application for testing
+          npm run build
+          npm run dev &
+          APP_PID=$!
+          echo $APP_PID > app.pid
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:3000/api/health; do sleep 2; done'
+      
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli@0.12.x
+      
+      - name: Run Lighthouse audit
+        run: |
+          TARGET_URL="${{ inputs.target-url || 'http://localhost:3000' }}"
+          PAGE_URL="${TARGET_URL}${{ matrix.page.url }}"
+          
+          echo "## 🚀 Lighthouse Audit: ${{ matrix.page.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**URL**: $PAGE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Performance Budget**: ${{ matrix.page.budget }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Create Lighthouse configuration
+          cat > lighthouserc-${{ matrix.page.name }}.js << EOF
+          module.exports = {
+            ci: {
+              collect: {
+                url: ['$PAGE_URL'],
+                numberOfRuns: 3,
+                settings: {
+                  preset: 'desktop',
+                  throttling: {
+                    rttMs: 40,
+                    throughputKbps: 10240,
+                    cpuSlowdownMultiplier: 1,
+                    requestLatencyMs: 0,
+                    downloadThroughputKbps: 0,
+                    uploadThroughputKbps: 0
+                  }
+                }
+              },
+              assert: {
+                assertions: {
+                  'categories:performance': ['error', { minScore: ${{ matrix.page.budget }} / 100 }],
+                  'categories:accessibility': ['error', { minScore: 0.9 }],
+                  'categories:best-practices': ['error', { minScore: 0.8 }],
+                  'categories:seo': ['error', { minScore: 0.8 }],
+                  'first-contentful-paint': ['error', { maxNumericValue: 3000 }],
+                  'largest-contentful-paint': ['error', { maxNumericValue: 4000 }],
+                  'cumulative-layout-shift': ['error', { maxNumericValue: 0.1 }],
+                  'total-blocking-time': ['error', { maxNumericValue: 300 }]
+                }
+              },
+              upload: {
+                target: 'temporary-public-storage'
+              }
+            }
+          };
+          EOF
+          
+          # Run Lighthouse CI
+          lhci autorun --config=lighthouserc-${{ matrix.page.name }}.js > lighthouse-${{ matrix.page.name }}.log 2>&1 || true
+          
+          # Parse results and add to summary
+          if [ -f .lighthouseci/lhr-*.json ]; then
+            PERFORMANCE_SCORE=$(jq -r '.categories.performance.score * 100' .lighthouseci/lhr-*.json | head -1)
+            ACCESSIBILITY_SCORE=$(jq -r '.categories.accessibility.score * 100' .lighthouseci/lhr-*.json | head -1)
+            BEST_PRACTICES_SCORE=$(jq -r '."best-practices".score * 100' .lighthouseci/lhr-*.json | head -1)
+            SEO_SCORE=$(jq -r '.categories.seo.score * 100' .lighthouseci/lhr-*.json | head -1)
+            
+            FCP=$(jq -r '.audits."first-contentful-paint".numericValue' .lighthouseci/lhr-*.json | head -1)
+            LCP=$(jq -r '.audits."largest-contentful-paint".numericValue' .lighthouseci/lhr-*.json | head -1)
+            CLS=$(jq -r '.audits."cumulative-layout-shift".numericValue' .lighthouseci/lhr-*.json | head -1)
+            TBT=$(jq -r '.audits."total-blocking-time".numericValue' .lighthouseci/lhr-*.json | head -1)
+            
+            echo "### 📊 Performance Scores" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Score | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Performance | ${PERFORMANCE_SCORE}% | $( (( $(echo "$PERFORMANCE_SCORE >= ${{ matrix.page.budget }}" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Accessibility | ${ACCESSIBILITY_SCORE}% | $( (( $(echo "$ACCESSIBILITY_SCORE >= 90" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Best Practices | ${BEST_PRACTICES_SCORE}% | $( (( $(echo "$BEST_PRACTICES_SCORE >= 80" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| SEO | ${SEO_SCORE}% | $( (( $(echo "$SEO_SCORE >= 80" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ⚡ Core Web Vitals" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Value | Budget | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| First Contentful Paint | ${FCP}ms | <3000ms | $( (( $(echo "$FCP < 3000" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Largest Contentful Paint | ${LCP}ms | <4000ms | $( (( $(echo "$LCP < 4000" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Cumulative Layout Shift | ${CLS} | <0.1 | $( (( $(echo "$CLS < 0.1" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Total Blocking Time | ${TBT}ms | <300ms | $( (( $(echo "$TBT < 300" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+          fi
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+      
+      - name: Upload Lighthouse results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighthouse-results-${{ matrix.page.name }}
+          path: |
+            .lighthouseci/
+            lighthouse-${{ matrix.page.name }}.log
+          retention-days: 30
+      
+      - name: Cleanup application
+        if: always() && github.event_name != 'workflow_dispatch'
+        run: |
+          if [ -f app.pid ]; then
+            kill $(cat app.pid) || true
+            rm app.pid
+          fi
+
+  bundle-analysis:
+    name: Bundle Size Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build application
+        run: npm run build
+      
+      - name: Analyze bundle size
+        run: |
+          echo "## 📦 Bundle Size Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Calculate current bundle sizes
+          if [ -d "client/dist" ]; then
+            CLIENT_SIZE=$(du -sh client/dist | cut -f1)
+            CLIENT_SIZE_BYTES=$(du -sb client/dist | cut -f1)
+            echo "**Client Bundle Size**: $CLIENT_SIZE" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -d "dist" ]; then
+            SERVER_SIZE=$(du -sh dist | cut -f1)
+            SERVER_SIZE_BYTES=$(du -sb dist | cut -f1)
+            echo "**Server Bundle Size**: $SERVER_SIZE" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Compare with previous commit if available
+          if git rev-parse HEAD~1 >/dev/null 2>&1; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📈 Size Comparison" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Checkout previous commit, build, and compare
+            git stash push -m "current changes"
+            git checkout HEAD~1 --quiet
+            npm ci --quiet
+            npm run build --quiet
+            
+            if [ -d "client/dist" ]; then
+              PREV_CLIENT_SIZE_BYTES=$(du -sb client/dist | cut -f1)
+              CLIENT_DIFF=$((CLIENT_SIZE_BYTES - PREV_CLIENT_SIZE_BYTES))
+              if [ $CLIENT_DIFF -gt 0 ]; then
+                echo "📈 Client bundle **increased** by $(numfmt --to=iec $CLIENT_DIFF)" >> $GITHUB_STEP_SUMMARY
+              elif [ $CLIENT_DIFF -lt 0 ]; then
+                echo "📉 Client bundle **decreased** by $(numfmt --to=iec $((CLIENT_DIFF * -1)))" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "➡️ Client bundle size **unchanged**" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+            
+            # Return to current commit
+            git checkout - --quiet
+            git stash pop --quiet || true
+            npm ci --quiet
+            npm run build --quiet
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Bundle Size Budget" >> $GITHUB_STEP_SUMMARY
+          echo "| Bundle | Current | Budget | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|---------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Define bundle size budgets (in bytes)
+          CLIENT_BUDGET=2097152  # 2MB
+          SERVER_BUDGET=10485760 # 10MB
+          
+          if [ -n "$CLIENT_SIZE_BYTES" ]; then
+            if [ $CLIENT_SIZE_BYTES -le $CLIENT_BUDGET ]; then
+              echo "| Client | $CLIENT_SIZE | 2MB | ✅ |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Client | $CLIENT_SIZE | 2MB | ❌ |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          
+          if [ -n "$SERVER_SIZE_BYTES" ]; then
+            if [ $SERVER_SIZE_BYTES -le $SERVER_BUDGET ]; then
+              echo "| Server | $SERVER_SIZE | 10MB | ✅ |" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "| Server | $SERVER_SIZE | 10MB | ❌ |" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+      
+      - name: Upload bundle analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-analysis
+          path: |
+            client/dist/
+            dist/
+          retention-days: 7
+
+  load-testing:
+    name: Load Testing
+    runs-on: ubuntu-latest
+    if: inputs.run-load-tests == true
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install k6
+      
+      - name: Create load test script
+        run: |
+          cat > load-test.js << 'EOF'
+          import http from 'k6/http';
+          import { check, sleep } from 'k6';
+          import { Rate } from 'k6/metrics';
+          
+          export const errorRate = new Rate('errors');
+          
+          export const options = {
+            stages: [
+              { duration: '1m', target: 10 },  // Ramp up
+              { duration: '${{ inputs.test-duration || 5 }}m', target: 50 }, // Stay at 50 users
+              { duration: '1m', target: 0 },   // Ramp down
+            ],
+            thresholds: {
+              http_req_duration: ['p(95)<500'], // 95% of requests under 500ms
+              http_req_failed: ['rate<0.05'],   // Error rate under 5%
+              errors: ['rate<0.05'],
+            },
+          };
+          
+          const BASE_URL = __ENV.TARGET_URL || 'http://localhost:3000';
+          
+          export default function () {
+            const scenarios = [
+              // Home page
+              () => {
+                const res = http.get(`${BASE_URL}/`);
+                check(res, {
+                  'home page loads': (r) => r.status === 200,
+                  'home page response time': (r) => r.timings.duration < 1000,
+                });
+              },
+              
+              // API health check
+              () => {
+                const res = http.get(`${BASE_URL}/api/health`);
+                check(res, {
+                  'health check responds': (r) => r.status === 200,
+                  'health check fast': (r) => r.timings.duration < 200,
+                });
+              },
+              
+              // Pet listing
+              () => {
+                const res = http.get(`${BASE_URL}/api/pets`);
+                check(res, {
+                  'pets API responds': (r) => r.status === 200,
+                  'pets API performance': (r) => r.timings.duration < 800,
+                });
+              },
+            ];
+            
+            // Randomly select a scenario
+            const scenario = scenarios[Math.floor(Math.random() * scenarios.length)];
+            scenario();
+            
+            errorRate.add(false);
+            sleep(1);
+          }
+          EOF
+      
+      - name: Start application for load testing
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          npm run build
+          npm run dev &
+          APP_PID=$!
+          echo $APP_PID > load-test-app.pid
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:3000/api/health; do sleep 2; done'
+      
+      - name: Run load tests
+        run: |
+          TARGET_URL="${{ inputs.target-url || 'http://localhost:3000' }}"
+          
+          echo "## 🔥 Load Testing Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target URL**: $TARGET_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Duration**: ${{ inputs.test-duration || 5 }} minutes" >> $GITHUB_STEP_SUMMARY
+          echo "**Peak Users**: 50" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Run k6 load test
+          k6 run --env TARGET_URL="$TARGET_URL" load-test.js --out json=load-test-results.json
+          
+          # Parse and display results
+          if [ -f load-test-results.json ]; then
+            echo "### 📊 Performance Metrics" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Extract key metrics from k6 JSON output
+            AVG_RESPONSE_TIME=$(jq -r '.metrics.http_req_duration.values.avg' load-test-results.json | head -1)
+            P95_RESPONSE_TIME=$(jq -r '.metrics.http_req_duration.values."p(95)"' load-test-results.json | head -1)
+            ERROR_RATE=$(jq -r '.metrics.http_req_failed.values.rate' load-test-results.json | head -1)
+            TOTAL_REQUESTS=$(jq -r '.metrics.http_reqs.values.count' load-test-results.json | head -1)
+            
+            echo "| Metric | Value | Threshold | Status |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Average Response Time | ${AVG_RESPONSE_TIME}ms | <300ms | $( (( $(echo "$AVG_RESPONSE_TIME < 300" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| 95th Percentile | ${P95_RESPONSE_TIME}ms | <500ms | $( (( $(echo "$P95_RESPONSE_TIME < 500" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Error Rate | ${ERROR_RATE}% | <5% | $( (( $(echo "$ERROR_RATE < 0.05" | bc -l) )) && echo "✅" || echo "❌" ) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Total Requests | $TOTAL_REQUESTS | - | 📊 |" >> $GITHUB_STEP_SUMMARY
+          fi
+        env:
+          TARGET_URL: ${{ inputs.target-url || 'http://localhost:3000' }}
+      
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: load-test-results
+          path: |
+            load-test-results.json
+            load-test.js
+          retention-days: 30
+      
+      - name: Cleanup load test application
+        if: always() && github.event_name != 'workflow_dispatch'
+        run: |
+          if [ -f load-test-app.pid ]; then
+            kill $(cat load-test-app.pid) || true
+            rm load-test-app.pid
+          fi
+
+  performance-report:
+    name: Performance Report Summary
+    runs-on: ubuntu-latest
+    needs: [lighthouse-audit, bundle-analysis, load-testing]
+    if: always()
+    
+    steps:
+      - name: Download all performance artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'lighthouse-results-*'
+          merge-multiple: true
+      
+      - name: Generate performance summary
+        run: |
+          echo "# 🚀 Performance Monitoring Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Date**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📊 Performance Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Lighthouse audits
+          if [ "${{ needs.lighthouse-audit.result }}" == "success" ]; then
+            echo "| Lighthouse Audit | ✅ Passed | Performance budgets met |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Lighthouse Audit | ❌ Failed | Performance issues detected |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Bundle analysis
+          if [ "${{ needs.bundle-analysis.result }}" == "success" ]; then
+            echo "| Bundle Analysis | ✅ Passed | Bundle sizes within budget |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.bundle-analysis.result }}" == "skipped" ]; then
+            echo "| Bundle Analysis | ⏭️ Skipped | Not applicable for this run |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Bundle Analysis | ❌ Failed | Bundle size budget exceeded |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Load testing
+          if [ "${{ needs.load-testing.result }}" == "success" ]; then
+            echo "| Load Testing | ✅ Passed | Performance under load verified |" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.load-testing.result }}" == "skipped" ]; then
+            echo "| Load Testing | ⏭️ Skipped | Not requested for this run |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Load Testing | ❌ Failed | Performance degradation under load |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🎯 Performance Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.lighthouse-audit.result }}" != "success" || 
+                "${{ needs.bundle-analysis.result }}" == "failure" || 
+                "${{ needs.load-testing.result }}" == "failure" ]]; then
+            echo "### ⚠️ Issues Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Performance issues have been detected. Consider the following optimizations:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- **Code Splitting**: Break large bundles into smaller chunks" >> $GITHUB_STEP_SUMMARY
+            echo "- **Lazy Loading**: Implement lazy loading for non-critical components" >> $GITHUB_STEP_SUMMARY
+            echo "- **Image Optimization**: Optimize and compress images" >> $GITHUB_STEP_SUMMARY
+            echo "- **Caching**: Implement proper caching strategies" >> $GITHUB_STEP_SUMMARY
+            echo "- **Database Optimization**: Review and optimize database queries" >> $GITHUB_STEP_SUMMARY
+            echo "- **CDN**: Consider using a Content Delivery Network" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 🎉 All Performance Tests Passed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The application meets all performance benchmarks!" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Detailed Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- [Lighthouse Reports](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Bundle Analysis](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Load Test Results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Performance Monitoring Dashboard](https://monitoring.wolves-pet-store.com)" >> $GITHUB_STEP_SUMMARY

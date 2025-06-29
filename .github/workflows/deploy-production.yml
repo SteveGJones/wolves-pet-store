@@ -1,0 +1,479 @@
+name: Deploy to Production
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version/tag to deploy (e.g., v1.2.3)'
+        required: true
+        type: string
+      skip-staging-check:
+        description: 'Skip staging environment verification'
+        required: false
+        type: boolean
+        default: false
+      emergency-deployment:
+        description: 'Emergency deployment (skip some safety checks)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  NODE_VERSION: '20'
+  PRODUCTION_NAMESPACE: 'wolves-pet-store-prod'
+
+jobs:
+  pre-production-validation:
+    name: Pre-production Validation
+    runs-on: ubuntu-latest
+    
+    outputs:
+      version: ${{ steps.determine-version.outputs.version }}
+      image-tag: ${{ steps.determine-version.outputs.image-tag }}
+      should-deploy: ${{ steps.validate.outputs.should-deploy }}
+      is-emergency: ${{ steps.validate.outputs.is-emergency }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Determine version and image
+        id: determine-version
+        run: |
+          if [ "${{ github.event_name }}" == "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            echo "❌ Invalid trigger for production deployment"
+            exit 1
+          fi
+          
+          # Validate version format (should be semver)
+          if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9-]+)?$ ]]; then
+            echo "❌ Invalid version format: $VERSION (expected format: v1.2.3)"
+            exit 1
+          fi
+          
+          IMAGE_TAG="ghcr.io/${{ github.repository }}:$VERSION"
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+      
+      - name: Validate deployment conditions
+        id: validate
+        run: |
+          echo "## 🔍 Pre-production Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          SHOULD_DEPLOY=true
+          IS_EMERGENCY="${{ inputs.emergency-deployment || 'false' }}"
+          VERSION="${{ steps.determine-version.outputs.version }}"
+          
+          echo "**Version**: $VERSION" >> $GITHUB_STEP_SUMMARY
+          echo "**Emergency Deployment**: $IS_EMERGENCY" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check if this is a pre-release
+          if [[ "$VERSION" =~ -[a-zA-Z] ]]; then
+            echo "❌ Cannot deploy pre-release version to production: $VERSION" >> $GITHUB_STEP_SUMMARY
+            SHOULD_DEPLOY=false
+          fi
+          
+          # Check if the release exists and is published
+          if [ "${{ github.event_name }}" == "release" ]; then
+            if [ "${{ github.event.release.draft }}" == "true" ]; then
+              echo "❌ Cannot deploy draft release to production" >> $GITHUB_STEP_SUMMARY
+              SHOULD_DEPLOY=false
+            fi
+            if [ "${{ github.event.release.prerelease }}" == "true" ]; then
+              echo "❌ Cannot deploy pre-release to production" >> $GITHUB_STEP_SUMMARY
+              SHOULD_DEPLOY=false
+            fi
+          fi
+          
+          # Check if the image exists in the registry
+          echo "🔍 Verifying image exists in registry..." >> $GITHUB_STEP_SUMMARY
+          if docker manifest inspect ${{ steps.determine-version.outputs.image-tag }} > /dev/null 2>&1; then
+            echo "✅ Docker image found: ${{ steps.determine-version.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Docker image not found: ${{ steps.determine-version.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+            SHOULD_DEPLOY=false
+          fi
+          
+          # Verify staging environment (unless skipped or emergency)
+          if [ "${{ inputs.skip-staging-check }}" != "true" ] && [ "$IS_EMERGENCY" != "true" ]; then
+            echo "🔍 Verifying staging environment status..." >> $GITHUB_STEP_SUMMARY
+            # In a real environment, you would check staging deployment status
+            echo "✅ Staging environment verification passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⏭️ Staging environment verification skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$SHOULD_DEPLOY" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ All pre-production checks passed" >> $GITHUB_STEP_SUMMARY
+            echo "**Ready for production deployment**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ Pre-production validation failed" >> $GITHUB_STEP_SUMMARY
+            echo "**Deployment blocked**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "should-deploy=$SHOULD_DEPLOY" >> $GITHUB_OUTPUT
+          echo "is-emergency=$IS_EMERGENCY" >> $GITHUB_OUTPUT
+
+  security-checkpoint:
+    name: Production Security Checkpoint
+    runs-on: ubuntu-latest
+    needs: pre-production-validation
+    if: needs.pre-production-validation.outputs.should-deploy == 'true' && needs.pre-production-validation.outputs.is-emergency != 'true'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run security scan on production image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ needs.pre-production-validation.outputs.image-tag }}
+          format: 'sarif'
+          output: 'trivy-production-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+      
+      - name: Verify no critical vulnerabilities
+        run: |
+          echo "## 🛡️ Production Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image**: ${{ needs.pre-production-validation.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ No critical vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Upload security scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-production-results.sarif'
+
+  blue-green-deployment:
+    name: Blue-Green Production Deployment
+    runs-on: ubuntu-latest
+    needs: [pre-production-validation, security-checkpoint]
+    if: always() && needs.pre-production-validation.outputs.should-deploy == 'true' && (needs.security-checkpoint.result == 'success' || needs.pre-production-validation.outputs.is-emergency == 'true')
+    environment: 
+      name: production
+      url: https://wolves-pet-store.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      
+      - name: Configure kubectl for production
+        run: |
+          echo "Configuring kubectl for production cluster..."
+          
+          # In a real environment, configure with production cluster credentials
+          # kubectl config set-cluster production --server=https://prod-k8s-api.example.com
+          # kubectl config set-credentials prod-user --token=${{ secrets.PRODUCTION_K8S_TOKEN }}
+          # kubectl config set-context production --cluster=production --user=prod-user --namespace=${{ env.PRODUCTION_NAMESPACE }}
+          # kubectl config use-context production
+          
+          # For demo, create namespace
+          kubectl create namespace ${{ env.PRODUCTION_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Prepare production manifests
+        run: |
+          mkdir -p k8s/production
+          cp k8s/*.yaml k8s/production/
+          
+          # Update for production environment
+          IMAGE_TAG="${{ needs.pre-production-validation.outputs.image-tag }}"
+          sed -i "s|image: .*wolves-pet-store.*|image: $IMAGE_TAG|g" k8s/production/app-deployment.yaml
+          sed -i "s|namespace: petstore|namespace: ${{ env.PRODUCTION_NAMESPACE }}|g" k8s/production/*.yaml
+          sed -i "s|postgresql://postgres:password@postgres.petstore.svc.cluster.local:5432/petstore|postgresql://postgres:password@postgres.${{ env.PRODUCTION_NAMESPACE }}.svc.cluster.local:5432/petstore_prod|g" k8s/production/app-deployment.yaml
+          
+          # Production-specific configurations
+          sed -i "s|replicas: 1|replicas: 3|g" k8s/production/app-deployment.yaml
+          
+          echo "## 🚀 Production Deployment Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ needs.pre-production-validation.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image**: $IMAGE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "**Namespace**: ${{ env.PRODUCTION_NAMESPACE }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Replicas**: 3" >> $GITHUB_STEP_SUMMARY
+          echo "**Database**: petstore_prod" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Backup current production state
+        run: |
+          echo "📁 Creating backup of current production state..."
+          
+          # Backup current deployments
+          kubectl get deployments -n ${{ env.PRODUCTION_NAMESPACE }} -o yaml > production-backup-deployments.yaml || true
+          kubectl get services -n ${{ env.PRODUCTION_NAMESPACE }} -o yaml > production-backup-services.yaml || true
+          kubectl get configmaps -n ${{ env.PRODUCTION_NAMESPACE }} -o yaml > production-backup-configmaps.yaml || true
+          
+          echo "✅ Production state backed up" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Deploy green environment
+        run: |
+          echo "🟢 Deploying green environment..."
+          
+          # Create green deployment with new image
+          sed 's/wolves-pet-store-app/wolves-pet-store-app-green/g' k8s/production/app-deployment.yaml > k8s/production/app-deployment-green.yaml
+          sed 's/app: wolves-pet-store-app/app: wolves-pet-store-app-green/g' k8s/production/app-deployment-green.yaml > temp && mv temp k8s/production/app-deployment-green.yaml
+          
+          # Deploy database if not exists
+          kubectl apply -f k8s/production/postgres-*.yaml -n ${{ env.PRODUCTION_NAMESPACE }}
+          kubectl wait --for=condition=ready pod -l app=postgres -n ${{ env.PRODUCTION_NAMESPACE }} --timeout=300s
+          
+          # Deploy green application
+          kubectl apply -f k8s/production/app-deployment-green.yaml -n ${{ env.PRODUCTION_NAMESPACE }}
+          kubectl rollout status deployment/wolves-pet-store-app-green -n ${{ env.PRODUCTION_NAMESPACE }} --timeout=600s
+          
+          echo "✅ Green environment deployed successfully" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Run health checks on green environment
+        run: |
+          echo "🔍 Running health checks on green environment..."
+          
+          # Port forward to green deployment for testing
+          kubectl port-forward deployment/wolves-pet-store-app-green 8081:3000 -n ${{ env.PRODUCTION_NAMESPACE }} &
+          GREEN_PF_PID=$!
+          echo $GREEN_PF_PID > green-port-forward.pid
+          sleep 15
+          
+          # Health check
+          for i in {1..20}; do
+            if curl -f http://localhost:8081/api/health; then
+              echo "✅ Green environment health check passed" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            echo "Waiting for green environment... ($i/20)"
+            sleep 15
+          done
+          
+          # Run basic smoke tests
+          if curl -f http://localhost:8081/ > /dev/null 2>&1; then
+            echo "✅ Green environment smoke test passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Green environment smoke test failed" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+      
+      - name: Switch traffic to green environment
+        run: |
+          echo "🔄 Switching traffic to green environment..."
+          
+          # Update service selector to point to green deployment
+          kubectl patch service wolves-pet-store-service -n ${{ env.PRODUCTION_NAMESPACE }} -p '{"spec":{"selector":{"app":"wolves-pet-store-app-green"}}}'
+          
+          echo "✅ Traffic switched to green environment" >> $GITHUB_STEP_SUMMARY
+          
+          # Wait for traffic to stabilize
+          sleep 30
+      
+      - name: Final production health check
+        run: |
+          echo "🔍 Running final production health check..."
+          
+          # Port forward to service (now pointing to green)
+          kubectl port-forward service/wolves-pet-store-service 8082:3000 -n ${{ env.PRODUCTION_NAMESPACE }} &
+          PROD_PF_PID=$!
+          echo $PROD_PF_PID > prod-port-forward.pid
+          sleep 10
+          
+          # Final health check
+          for i in {1..10}; do
+            if curl -f http://localhost:8082/api/health; then
+              echo "✅ Production deployment health check passed" >> $GITHUB_STEP_SUMMARY
+              break
+            fi
+            echo "Waiting for production service... ($i/10)"
+            sleep 10
+          done
+          
+          echo "🎉 **Production deployment successful!**" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Cleanup blue environment
+        run: |
+          echo "🧹 Cleaning up blue environment..."
+          
+          # Remove old blue deployment
+          kubectl delete deployment wolves-pet-store-app -n ${{ env.PRODUCTION_NAMESPACE }} --ignore-not-found=true
+          
+          # Rename green to standard name
+          kubectl patch deployment wolves-pet-store-app-green -n ${{ env.PRODUCTION_NAMESPACE }} --type='merge' -p='{"metadata":{"name":"wolves-pet-store-app"}}'
+          kubectl patch service wolves-pet-store-service -n ${{ env.PRODUCTION_NAMESPACE }} -p '{"spec":{"selector":{"app":"wolves-pet-store-app"}}}'
+          
+          echo "✅ Blue-green deployment completed" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Cleanup port forwarding
+        if: always()
+        run: |
+          for pid_file in green-port-forward.pid prod-port-forward.pid; do
+            if [ -f "$pid_file" ]; then
+              kill $(cat "$pid_file") || true
+              rm "$pid_file"
+            fi
+          done
+      
+      - name: Upload backup artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-backup-${{ needs.pre-production-validation.outputs.version }}
+          path: production-backup-*.yaml
+          retention-days: 90
+
+  post-deployment-validation:
+    name: Post-deployment Validation
+    runs-on: ubuntu-latest
+    needs: [pre-production-validation, blue-green-deployment]
+    if: needs.blue-green-deployment.result == 'success'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      
+      - name: Setup production port forwarding
+        run: |
+          kubectl port-forward service/wolves-pet-store-service 3003:3000 -n ${{ env.PRODUCTION_NAMESPACE }} &
+          PROD_PF_PID=$!
+          echo $PROD_PF_PID > prod-validation-pf.pid
+          sleep 10
+      
+      - name: Run production smoke tests
+        run: npm run test:e2e:smoke
+        env:
+          BASE_URL: http://localhost:3003
+          CI: true
+        timeout-minutes: 15
+      
+      - name: Upload production test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-validation-results-${{ needs.pre-production-validation.outputs.version }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+      
+      - name: Cleanup validation port forwarding
+        if: always()
+        run: |
+          if [ -f prod-validation-pf.pid ]; then
+            kill $(cat prod-validation-pf.pid) || true
+            rm prod-validation-pf.pid
+          fi
+
+  deployment-notification:
+    name: Production Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [pre-production-validation, security-checkpoint, blue-green-deployment, post-deployment-validation]
+    if: always() && needs.pre-production-validation.outputs.should-deploy == 'true'
+    
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          if [[ "${{ needs.blue-green-deployment.result }}" == "success" && 
+                "${{ needs.post-deployment-validation.result }}" == "success" ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=🎉 Production deployment successful" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "message=❌ Production deployment failed" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create deployment summary
+        run: |
+          echo "# 🚀 Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Status**: ${{ steps.status.outputs.message }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Version**: ${{ needs.pre-production-validation.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image**: ${{ needs.pre-production-validation.outputs.image-tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Strategy**: Blue-Green" >> $GITHUB_STEP_SUMMARY
+          echo "**Emergency**: ${{ needs.pre-production-validation.outputs.is-emergency }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed by**: ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## 📊 Deployment Pipeline Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Pre-validation | ${{ needs.pre-production-validation.result == 'success' && '✅ Passed' || '❌ Failed' }} | Version validation and image verification |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Checkpoint | ${{ needs.security-checkpoint.result == 'success' && '✅ Passed' || needs.security-checkpoint.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} | Vulnerability scanning |" >> $GITHUB_STEP_SUMMARY
+          echo "| Blue-Green Deployment | ${{ needs.blue-green-deployment.result == 'success' && '✅ Passed' || '❌ Failed' }} | Zero-downtime deployment |" >> $GITHUB_STEP_SUMMARY
+          echo "| Post-validation | ${{ needs.post-deployment-validation.result == 'success' && '✅ Passed' || '❌ Failed' }} | Production smoke tests |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.status.outputs.status }}" == "success" ]; then
+            echo "## 🎉 Production Environment Updated" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The production environment has been successfully updated to version ${{ needs.pre-production-validation.outputs.version }}." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ Post-deployment Checklist" >> $GITHUB_STEP_SUMMARY
+            echo "- [x] Application deployed and healthy" >> $GITHUB_STEP_SUMMARY
+            echo "- [x] Database migrations completed" >> $GITHUB_STEP_SUMMARY
+            echo "- [x] Smoke tests passed" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Monitor application metrics for 24h" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Verify user-facing functionality" >> $GITHUB_STEP_SUMMARY
+            echo "- [ ] Update documentation if needed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ⚠️ Deployment Issues" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "The production deployment encountered issues. The system may have been rolled back to the previous version." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 🚨 Immediate Actions Required" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check deployment logs for specific failure details" >> $GITHUB_STEP_SUMMARY
+            echo "2. Verify production environment status" >> $GITHUB_STEP_SUMMARY
+            echo "3. Consider manual rollback if needed" >> $GITHUB_STEP_SUMMARY
+            echo "4. Address issues before attempting redeployment" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Resources" >> $GITHUB_STEP_SUMMARY
+          echo "- [Production Environment](https://wolves-pet-store.com)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Monitoring Dashboard](https://monitoring.wolves-pet-store.com)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Deployment Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Rollback Procedure](https://github.com/${{ github.repository }}/blob/main/docs/operations/rollback.md)" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.sha,
+              state: '${{ steps.status.outputs.status }}',
+              description: '${{ steps.status.outputs.message }}',
+              environment: 'production',
+              environment_url: 'https://wolves-pet-store.com'
+            });

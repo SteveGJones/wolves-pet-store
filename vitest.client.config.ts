@@ -4,9 +4,9 @@ import path from 'path';
 export default defineConfig({
   test: {
     globals: true,
-    environment: 'node',
-    setupFiles: ['./server/__tests__/setup.ts'],
-    exclude: ['**/node_modules/**', '**/dist/**', '**/e2e/**'], // Exclude e2e tests
+    environment: 'jsdom',
+    setupFiles: ['./client/src/setupTests.ts'],
+    include: ['client/**/*.test.tsx'], // Only include client-side tests
   },
   resolve: {
     alias: {

@@ -1,7 +1,6 @@
 import type { Express } from "express";
 import { createServer, type Server } from "http";
-import { storage } from "./storage";
-import { setupAuth, isAuthenticated, registerSchema, loginSchema, createUser, findUserByEmail, authenticateUser, createUserSession } from "./auth";
+
 import {
   insertPetSchema,
   insertInquirySchema,
@@ -10,7 +9,21 @@ import {
 } from "@shared/schema";
 import { z } from "zod";
 
-export async function registerRoutes(app: Express): Promise<Server> {
+export async function registerRoutes(app: Express, dependencies: { storage: any, auth: any, db: any }): Promise<Server> {
+  const { storage, auth, db } = dependencies;
+  
+  // Database health check function
+  async function checkDatabaseHealth(): Promise<boolean> {
+    try {
+      // Simple query to check database connectivity
+      await db.execute('SELECT 1');
+      return true;
+    } catch (error) {
+      console.error('Database health check failed:', error);
+      return false;
+    }
+  }
+  
   // Health check endpoint for K8s probes
   app.get('/api/health', async (req, res) => {
     try {
@@ -39,31 +52,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Database health check function
-  async function checkDatabaseHealth(): Promise<boolean> {
-    try {
-      const { db } = await import('./db');
-      // Simple query to check database connectivity
-      await db.execute('SELECT 1');
-      return true;
-    } catch (error) {
-      console.error('Database health check failed:', error);
-      return false;
-    }
-  }
-
   // Auth middleware
-  await setupAuth(app);
+  await auth.setupAuth(app);
 
   // New Authentication Endpoints
   // Registration endpoint
   app.post('/api/auth/register', async (req, res) => {
     try {
       // Validate input
-      const validatedData = registerSchema.parse(req.body);
+      const validatedData = auth.registerSchema.parse(req.body);
       
       // Check if user already exists
-      const existingUser = await findUserByEmail(validatedData.email);
+      const existingUser = await auth.findUserByEmail(validatedData.email);
       if (existingUser) {
         return res.status(409).json({
           error: "An account with this email already exists",
@@ -72,10 +72,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       // Create user
-      const user = await createUser(validatedData);
+      const user = await auth.createUser(validatedData);
       
       // Create session
-      req.session.user = createUserSession(user);
+      req.session.user = auth.createUserSession(user);
       
       res.status(201).json({ user });
     } catch (error) {
@@ -99,10 +99,10 @@ export async function registerRoutes(app: Express): Promise<Server> {
   app.post('/api/auth/login', async (req, res) => {
     try {
       // Validate input
-      const { email, password } = loginSchema.parse(req.body);
+      const { email, password } = auth.loginSchema.parse(req.body);
       
       // Authenticate user
-      const user = await authenticateUser(email, password);
+      const user = await auth.authenticateUser(email, password);
       if (!user) {
         return res.status(401).json({
           error: "Invalid email or password",
@@ -111,7 +111,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
       
       // Create session
-      req.session.user = createUserSession(user);
+      req.session.user = auth.createUserSession(user);
       
       res.json({ user });
     } catch (error) {
@@ -149,7 +149,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Get current user endpoint
-  app.get('/api/auth/user', isAuthenticated, (req, res) => {
+  app.get('/api/auth/user', auth.isAuthenticated, (req, res) => {
     res.json({ user: req.user });
   });
 
@@ -165,7 +165,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/pet-categories", isAuthenticated, async (req: any, res) => {
+  app.post("/api/pet-categories", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -215,7 +215,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/pets", isAuthenticated, async (req: any, res) => {
+  app.post("/api/pets", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -230,7 +230,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.put("/api/pets/:id", isAuthenticated, async (req: any, res) => {
+  app.put("/api/pets/:id", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -246,7 +246,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.delete("/api/pets/:id", isAuthenticated, async (req: any, res) => {
+  app.delete("/api/pets/:id", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -262,7 +262,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Admin route for pets with categories
-  app.get("/api/admin/pets", isAuthenticated, async (req: any, res) => {
+  app.get("/api/admin/pets", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -299,7 +299,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.get("/api/admin/inquiries", isAuthenticated, async (req: any, res) => {
+  app.get("/api/admin/inquiries", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -313,7 +313,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.put("/api/admin/inquiries/:id", isAuthenticated, async (req: any, res) => {
+  app.put("/api/admin/inquiries/:id", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });
@@ -330,7 +330,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Wishlist
-  app.get("/api/wishlist", isAuthenticated, async (req: any, res) => {
+  app.get("/api/wishlist", auth.isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.userId;
       const wishlist = await storage.getUserWishlist(userId);
@@ -341,7 +341,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.post("/api/wishlist", isAuthenticated, async (req: any, res) => {
+  app.post("/api/wishlist", auth.isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.userId;
       const { petId } = req.body;
@@ -359,7 +359,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  app.delete("/api/wishlist/:petId", isAuthenticated, async (req: any, res) => {
+  app.delete("/api/wishlist/:petId", auth.isAuthenticated, async (req: any, res) => {
     try {
       const userId = req.user.userId;
       const petId = Number(req.params.petId);
@@ -373,7 +373,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   // Dashboard stats
-  app.get("/api/admin/dashboard-stats", isAuthenticated, async (req: any, res) => {
+  app.get("/api/admin/dashboard-stats", auth.isAuthenticated, async (req: any, res) => {
     try {
       if (!req.user?.isAdmin) {
         return res.status(403).json({ message: "Admin access required" });

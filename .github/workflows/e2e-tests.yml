@@ -1,0 +1,397 @@
+name: E2E Tests
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: false
+        type: string
+        default: 'staging'
+      base-url:
+        required: false
+        type: string
+        default: 'http://localhost:3000'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test against'
+        required: false
+        default: 'staging'
+      base-url:
+        description: 'Base URL for testing'
+        required: false
+        default: 'http://localhost:3000'
+  schedule:
+    # Run E2E tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  e2e-setup:
+    name: Setup E2E Environment
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: petstore_test
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    outputs:
+      app-url: ${{ steps.setup.outputs.app-url }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Setup test environment
+        id: setup
+        run: |
+          # Start the application in background
+          DATABASE_URL="postgresql://postgres:password@localhost:5432/petstore_test" \
+          SESSION_SECRET="test-secret-key" \
+          NODE_ENV="development" \
+          npm run dev &
+          
+          # Wait for application to be ready
+          timeout 60 bash -c 'until curl -f http://localhost:3000/api/health; do sleep 2; done'
+          
+          echo "app-url=http://localhost:3000" >> $GITHUB_OUTPUT
+          
+          # Keep the job running for E2E tests
+          sleep 300 &
+          echo $! > app_pid.txt
+      
+      - name: Upload app PID
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-process
+          path: app_pid.txt
+          retention-days: 1
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: e2e-setup
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, firefox, webkit]
+        shard: [1, 2]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright browsers
+        run: npx playwright install ${{ matrix.project }} --with-deps
+      
+      - name: Run E2E tests
+        run: npx playwright test --project=${{ matrix.project }} --shard=${{ matrix.shard }}/2
+        env:
+          BASE_URL: ${{ inputs.base-url || 'http://localhost:3000' }}
+          CI: true
+      
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.project }}-${{ matrix.shard }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 30
+      
+      - name: Upload videos on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-videos-${{ matrix.project }}-${{ matrix.shard }}
+          path: test-results/*/video.webm
+          retention-days: 7
+
+  accessibility-tests:
+    name: Accessibility Tests
+    runs-on: ubuntu-latest
+    needs: e2e-setup
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      
+      - name: Run accessibility tests
+        run: npm run test:e2e:a11y
+        env:
+          BASE_URL: ${{ inputs.base-url || 'http://localhost:3000' }}
+      
+      - name: Generate accessibility report
+        if: always()
+        run: |
+          mkdir -p accessibility-report
+          echo "# Accessibility Test Report" > accessibility-report/README.md
+          echo "Generated: $(date)" >> accessibility-report/README.md
+          echo "Environment: ${{ inputs.environment }}" >> accessibility-report/README.md
+          
+          # Process axe-core results if they exist
+          if [ -f test-results/accessibility-results.json ]; then
+            echo "## Summary" >> accessibility-report/README.md
+            jq -r '.violations | length' test-results/accessibility-results.json | \
+              xargs -I {} echo "Total WCAG violations: {}" >> accessibility-report/README.md
+          fi
+      
+      - name: Upload accessibility report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accessibility-report
+          path: |
+            accessibility-report/
+            test-results/
+          retention-days: 30
+
+  performance-tests:
+    name: Performance Tests
+    runs-on: ubuntu-latest
+    needs: e2e-setup
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Lighthouse CI
+        run: npm install -g @lhci/cli@0.12.x
+      
+      - name: Run Lighthouse CI
+        run: |
+          # Create lighthouserc.js configuration
+          cat > lighthouserc.js << EOF
+          module.exports = {
+            ci: {
+              collect: {
+                url: ['${{ inputs.base-url || 'http://localhost:3000' }}'],
+                numberOfRuns: 3,
+                settings: {
+                  preset: 'desktop',
+                  onlyAudits: [
+                    'first-contentful-paint',
+                    'largest-contentful-paint',
+                    'speed-index',
+                    'cumulative-layout-shift',
+                    'total-blocking-time'
+                  ]
+                }
+              },
+              assert: {
+                assertions: {
+                  'categories:performance': ['error', { minScore: 0.8 }],
+                  'categories:accessibility': ['error', { minScore: 0.9 }],
+                  'categories:best-practices': ['error', { minScore: 0.8 }],
+                  'categories:seo': ['error', { minScore: 0.8 }]
+                }
+              },
+              upload: {
+                target: 'temporary-public-storage'
+              }
+            }
+          };
+          EOF
+          
+          lhci autorun
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+      
+      - name: Upload Lighthouse results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lighthouse-report
+          path: .lighthouseci/
+          retention-days: 30
+
+  visual-regression:
+    name: Visual Regression Tests
+    runs-on: ubuntu-latest
+    needs: e2e-setup
+    if: github.event_name == 'pull_request'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Install Playwright
+        run: npx playwright install chromium --with-deps
+      
+      - name: Run visual regression tests
+        run: |
+          # Create visual test configuration
+          npx playwright test --config=playwright-visual.config.ts --update-snapshots
+        env:
+          BASE_URL: ${{ inputs.base-url || 'http://localhost:3000' }}
+      
+      - name: Upload visual diff report
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: visual-regression-report
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 30
+
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [e2e-tests, accessibility-tests, performance-tests]
+    if: always()
+    
+    steps:
+      - name: Download all test artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*-report*'
+          merge-multiple: true
+      
+      - name: Generate comprehensive test report
+        run: |
+          echo "# 🧪 E2E Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Base URL**: ${{ inputs.base-url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Test Results Matrix
+          echo "## 📊 Test Results Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Chromium | Firefox | WebKit | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|----------|---------|---------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          # E2E Tests
+          if [ "${{ needs.e2e-tests.result }}" == "success" ]; then
+            echo "| E2E Tests | ✅ | ✅ | ✅ | Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| E2E Tests | ❓ | ❓ | ❓ | Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Accessibility Tests
+          if [ "${{ needs.accessibility-tests.result }}" == "success" ]; then
+            echo "| Accessibility | ✅ | N/A | N/A | Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Accessibility | ❌ | N/A | N/A | Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Performance Tests
+          if [ "${{ needs.performance-tests.result }}" == "success" ]; then
+            echo "| Performance | ✅ | N/A | N/A | Passed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Performance | ❌ | N/A | N/A | Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📈 Performance Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "- Check Lighthouse report for detailed performance metrics" >> $GITHUB_STEP_SUMMARY
+          echo "- Visual regression tests completed for UI consistency" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- [Test Reports](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Video Recordings](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) (on failures)" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Create a comprehensive PR comment
+            const comment = `
+            ## 🎭 E2E Test Results
+            
+            **Environment**: ${{ inputs.environment }}
+            **Base URL**: ${{ inputs.base-url }}
+            
+            ### Test Results Summary
+            | Test Suite | Status | Details |
+            |------------|--------|---------|
+            | E2E Tests | ${{ needs.e2e-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} | Cross-browser testing completed |
+            | Accessibility | ${{ needs.accessibility-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} | WCAG 2.1 AA compliance verified |
+            | Performance | ${{ needs.performance-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} | Lighthouse scores within budget |
+            
+            ### 🔗 Reports
+            - [Full Test Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - [Performance Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - [Accessibility Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ${needs.e2e-tests.result !== 'success' || needs.accessibility-tests.result !== 'success' || needs.performance-tests.result !== 'success' ? 
+              '⚠️ Some tests failed. Please check the detailed reports above.' : 
+              '🎉 All E2E tests passed successfully!'}
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

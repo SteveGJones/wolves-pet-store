@@ -1,0 +1,351 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [main, develop, code-migration-proposal]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security scans daily at 3 AM UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  dependency-scan:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run npm audit
+        run: |
+          echo "## 🔍 NPM Security Audit Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Run audit and capture results
+          if npm audit --audit-level=moderate; then
+            echo "✅ No security vulnerabilities found in dependencies" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Security vulnerabilities detected. See details below:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            npm audit --audit-level=moderate >> $GITHUB_STEP_SUMMARY || true
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Run Snyk security scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=medium --json
+        continue-on-error: true
+      
+      - name: Upload Snyk results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+        continue-on-error: true
+
+  code-analysis:
+    name: Code Security Analysis
+    runs-on: ubuntu-latest
+    
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript, typescript
+          queries: security-and-quality
+      
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v2
+      
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:javascript"
+
+  secret-scan:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Run TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: main
+          head: HEAD
+          extra_args: --debug --only-verified
+      
+      - name: Check for sensitive files
+        run: |
+          echo "## 🔐 Sensitive File Detection" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Define patterns for sensitive files
+          SENSITIVE_PATTERNS=(
+            "*.pem"
+            "*.key" 
+            "*.p12"
+            "*.pfx"
+            ".env.production"
+            ".env.local"
+            "id_rsa*"
+            "*.crt"
+            "*.cer"
+            "config.json"
+            "secrets.json"
+          )
+          
+          FOUND_FILES=()
+          for pattern in "${SENSITIVE_PATTERNS[@]}"; do
+            while IFS= read -r -d '' file; do
+              FOUND_FILES+=("$file")
+            done < <(find . -name "$pattern" -type f -print0 2>/dev/null)
+          done
+          
+          if [ ${#FOUND_FILES[@]} -eq 0 ]; then
+            echo "✅ No sensitive files detected" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Sensitive files detected:" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            for file in "${FOUND_FILES[@]}"; do
+              echo "- \`$file\`" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please review these files and ensure they don't contain sensitive information." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    needs: [dependency-scan]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Build Docker image for scanning
+        run: |
+          docker build -t wolves-pet-store:scan .
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'wolves-pet-store:scan'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run Trivy config scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-config-results.sarif'
+      
+      - name: Upload config scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-config-results.sarif'
+
+  kubernetes-security:
+    name: Kubernetes Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Polaris security scan
+        run: |
+          # Install Polaris
+          curl -L https://github.com/FairwindsOps/polaris/releases/latest/download/polaris_linux_amd64.tar.gz | tar xz
+          chmod +x polaris
+          
+          echo "## 🛡️ Kubernetes Security Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Scan Kubernetes manifests
+          if ./polaris audit --audit-path k8s/ --format=pretty > polaris-results.txt; then
+            echo "✅ Kubernetes manifests passed security validation" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Kubernetes security issues found:" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            cat polaris-results.txt >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Check for hardcoded secrets in manifests
+        run: |
+          echo "## 🔍 Kubernetes Secret Detection" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for potential hardcoded secrets
+          SECRET_PATTERNS=(
+            "password.*=.*[\"'][^\"']{8,}[\"']"
+            "token.*=.*[\"'][^\"']{20,}[\"']"
+            "key.*=.*[\"'][^\"']{16,}[\"']"
+            "secret.*=.*[\"'][^\"']{12,}[\"']"
+          )
+          
+          FOUND_SECRETS=false
+          for pattern in "${SECRET_PATTERNS[@]}"; do
+            if grep -r -i -E "$pattern" k8s/ --include="*.yaml" --include="*.yml"; then
+              FOUND_SECRETS=true
+            fi
+          done
+          
+          if [ "$FOUND_SECRETS" = false ]; then
+            echo "✅ No hardcoded secrets detected in Kubernetes manifests" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Potential hardcoded secrets detected in Kubernetes manifests" >> $GITHUB_STEP_SUMMARY
+            echo "Please review and use Kubernetes secrets or environment variables instead." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  security-report:
+    name: Security Report Summary
+    runs-on: ubuntu-latest
+    needs: [dependency-scan, code-analysis, secret-scan, container-scan, kubernetes-security]
+    if: always()
+    
+    steps:
+      - name: Generate security summary
+        run: |
+          echo "# 🛡️ Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository**: ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit**: ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Date**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Security scan results matrix
+          echo "## 📊 Security Scan Matrix" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan Type | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|---------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Dependency scan
+          if [ "${{ needs.dependency-scan.result }}" == "success" ]; then
+            echo "| Dependencies | ✅ Passed | No vulnerabilities detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Dependencies | ❌ Failed | Vulnerabilities found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Code analysis
+          if [ "${{ needs.code-analysis.result }}" == "success" ]; then
+            echo "| Code Analysis | ✅ Passed | No security issues detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Code Analysis | ❌ Failed | Security issues found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Secret scan
+          if [ "${{ needs.secret-scan.result }}" == "success" ]; then
+            echo "| Secret Detection | ✅ Passed | No secrets detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Secret Detection | ❌ Failed | Secrets or sensitive files found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Container scan
+          if [ "${{ needs.container-scan.result }}" == "success" ]; then
+            echo "| Container Security | ✅ Passed | No vulnerabilities in image |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Container Security | ❌ Failed | Container vulnerabilities found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Kubernetes security
+          if [ "${{ needs.kubernetes-security.result }}" == "success" ]; then
+            echo "| Kubernetes Security | ✅ Passed | Manifests are secure |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Kubernetes Security | ❌ Failed | Security issues in manifests |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔗 Detailed Reports" >> $GITHUB_STEP_SUMMARY
+          echo "- [Security Overview](https://github.com/${{ github.repository }}/security)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Vulnerability Alerts](https://github.com/${{ github.repository }}/security/dependabot)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Code Scanning](https://github.com/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Action Results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Comment PR with security results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = `
+            ## 🛡️ Security Scan Results
+            
+            **Branch**: ${{ github.ref_name }}
+            **Commit**: ${{ github.sha }}
+            
+            ### Security Status Summary
+            | Scan Type | Status |
+            |-----------|--------|
+            | Dependencies | ${{ needs.dependency-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Code Analysis | ${{ needs.code-analysis.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Secret Detection | ${{ needs.secret-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Container Security | ${{ needs.container-scan.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            | Kubernetes Security | ${{ needs.kubernetes-security.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+            
+            ### 🔗 Reports
+            - [Full Security Report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            - [Security Overview](https://github.com/${{ github.repository }}/security)
+            - [Code Scanning Alerts](https://github.com/${{ github.repository }}/security/code-scanning)
+            
+            ${
+              needs.dependency-scan.result !== 'success' || 
+              needs.code-analysis.result !== 'success' || 
+              needs.secret-scan.result !== 'success' || 
+              needs.container-scan.result !== 'success' || 
+              needs.kubernetes-security.result !== 'success' ?
+              '⚠️ **Security issues detected**. Please review the detailed reports and resolve any findings before merging.' :
+              '🎉 **All security scans passed**. No security issues detected!'
+            }
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
